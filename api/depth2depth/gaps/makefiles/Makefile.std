@@ -33,7 +33,7 @@ ARCH=$(shell uname -m)
 CC=g++
 BASE_CFLAGS=$(USER_CFLAGS) $(OS_CFLAGS) -Wall -I. -I../../pkgs 
 DEBUG_CFLAGS=$(BASE_CFLAGS) -g
-OPT_CFLAGS=$(BASE_CFLAGS) -O3 -DNDEBUG
+OPT_CFLAGS=$(BASE_CFLAGS) -O3 -DNDEBUG -fopenmp
 CFLAGS=$(DEBUG_CFLAGS)
 
 #ifeq ("$(OS)","Darwin")

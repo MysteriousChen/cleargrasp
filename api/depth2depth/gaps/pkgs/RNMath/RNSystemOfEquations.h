@@ -1,7 +1,5 @@
 // Include file for system of equation class
 
-
-
 ////////////////////////////////////////////////////////////////////////
 // Just making sure
 ////////////////////////////////////////////////////////////////////////
@@ -10,10 +8,11 @@
 #define __RN_SYSTEM_OF_EQUATIONS__
 
 
-
 ////////////////////////////////////////////////////////////////////////
 // Class definition
 ////////////////////////////////////////////////////////////////////////
+#include <chrono>
+#include <fstream>
 
 class RNSystemOfEquations {
 public:
@@ -161,6 +160,7 @@ RemoveUpperBound(int variable)
 ////////////////////////////////////////////////////////////////////////
 
 enum {
+  RN_AMGCL_SOLVER,
   RN_CERES_SOLVER,
   RN_MINPACK_SOLVER,
   RN_SPLM_SOLVER,
@@ -182,8 +182,252 @@ enum {
 // #define RN_NO_CERES
 // #define RN_USE_CSPARSE
 // #define RN_NO_CSPARSE
+#define RN_USE_AMGCL
+
+////////////////////////////////////////////////////////////////////////
+// AMGCL Stuff
+////////////////////////////////////////////////////////////////////////
+#ifdef RN_NO_AMGCL
+#undef RN_USE_AMGCL
+#endif
+#ifdef RN_USE_AMGCL
+// New using amgcl library
+#include "CSparse/CSparse.h"
+#include <amgcl/backend/builtin.hpp>
+#include <amgcl/make_solver.hpp>
+#include <amgcl/amg.hpp>
+#include <amgcl/coarsening/smoothed_aggregation.hpp>
+#include <amgcl/relaxation/spai0.hpp>
+#include <amgcl/solver/bicgstab.hpp>
+#include <amgcl/solver/bicgstabl.hpp>
+#include <amgcl/adapter/crs_tuple.hpp>
+#include <iostream>
+#include <vector>
+#include <cmath>
+
+typedef amgcl::backend::builtin<double> Backend;
+//typedef amgcl::backend::vexcl<double> Backend;
+
+typedef amgcl::make_solver<
+    amgcl::amg<
+        Backend,
+        amgcl::coarsening::smoothed_aggregation,
+        amgcl::relaxation::spai0
+        >,
+    amgcl::solver::bicgstabl<Backend>
+    > Solver;
+
+static
+void Csparse2AMGCL(cs* a, std::vector<int> &ptr, std::vector<int> &col, std::vector<double> &val){
+  
+  // CSC to CSR 
+  int m = a->m;
+  int nz = a->nzmax;
+  int *p = a->p;
+  int *i = a->i;
+  double *x = a->x;
+
+  // initial memory space
+  ptr.resize(m+1);
+  col.resize(nz);
+  val.resize(nz);
+
+  for(int idx=0; idx<nz; ++idx){
+    ptr[i[idx]]++;
+  }
+
+  //cumsum the nnz per column to get ptr
+  int cumsum = 0;
+  for(int _col=0; _col<m; ++_col){
+    int temp = ptr[_col];
+    ptr[_col] = cumsum;
+    cumsum += temp;
+  }
+  ptr[m] = nz;
+
+  for(int row=0; row<m; ++row){
+    for(int jj=p[row]; jj<p[row+1]; jj++){
+      int _col = i[jj];
+      int dest = ptr[_col];
+
+      col[dest] = row;
+      val[dest] = x[jj];
+
+      ptr[_col]++;
+    }
+  }
+
+  int last = 0;
+  for(int _col=0; _col<=m; ++_col){
+    int temp = ptr[_col];
+    ptr[_col] = last;
+    last = temp;
+  }
+
+}
 
 
+static int 
+MinimizeAMGCL(const RNSystemOfEquations *system, RNScalar *io, RNScalar tolerance)
+{
+
+  //std::ofstream ansfile, myfile;
+  //ansfile.open("Result.txt");
+  //myfile.open("SparseMat.txt");
+  std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+  std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
+
+  begin = std::chrono::steady_clock::now();
+  // Get convenient variables
+  const int n = system->NVariables();
+  const int mm = system->NEquations();
+  const int max_nz = system->NPartialDerivatives();
+
+  end = std::chrono::steady_clock::now();
+  std::cout << "Initial Time = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
+  // Formulate problem into compress sparse matrix  
+  std::vector<int>    ptr, col;
+  std::vector<double> val, rhs;
+
+  ptr.clear();
+  col.clear();
+  val.clear();
+  rhs.resize(mm);
+
+  begin = std::chrono::steady_clock::now();
+  // Allocate matrix
+  cs *a = cs_spalloc (0, n, max_nz, 1, 1);
+  if (!a) {
+    fprintf(stderr, "Unable to allocate cs matrix: %d %d\n", n, max_nz);
+    return 0;
+  }
+
+  double *b = new double [ mm ];
+  for (int i = 0; i < mm; i++) b[i] = 0;
+  
+  // Temporary information 
+  double *x_temp = new double [ n ];
+  for (int i = 0; i < n; i++) x_temp[i] = 0;
+
+  double *lhs = new double [ n ];
+  for (int i = 0; i < n; i++) lhs[i] = 0;
+  end = std::chrono::steady_clock::now();
+  std::cout << "Setup Time = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
+
+  begin = std::chrono::steady_clock::now();
+  // Fill matrix
+  int m = 0;
+  for (int i = 0; i < system->NEquations(); i++) {
+    RNEquation *equation = system->Equation(i);
+    // Initialize constant term
+    double rhs_val = -equation->Evaluate(x_temp);
+    // Mark variables in equation
+    int nz = 0;
+    int variable_count = 0;
+    RNSystemOfEquations *tmp = (RNSystemOfEquations *) system;
+    equation->UpdateVariableIndex(n, variable_count, tmp->variable_marks, tmp->current_mark++, tmp->index_to_variable);
+    for (int j = 0; j < variable_count; j++) {
+      int v = tmp->index_to_variable[j];
+      lhs[v] = equation->PartialDerivative(x_temp, v);
+      if (lhs[v] != 0) nz++;
+    }
+
+    // Add data to matrix if there are nonzero entries 
+    if (nz > 0) {
+      assert(m < mm);
+      for (int j = 0; j < variable_count; j++) {
+        int v = tmp->index_to_variable[j];
+        if (lhs[v] == 0) continue;
+        cs_entry(a, m, v, lhs[v]);
+      }
+      b[m] = rhs_val;
+      m++;
+    }
+  }
+  // Just checking
+  assert(a->m == m);
+  assert(a->n == n);
+  assert(a->n == system->NVariables());
+  assert(a->m <= system->NEquations());
+  assert(a->nz <= max_nz);
+  end = std::chrono::steady_clock::now();
+  std::cout << "Fill Matrix = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
+
+  begin = std::chrono::steady_clock::now();
+  // Setup aT * a * x = aT * b        
+  cs *A = cs_compress(a);
+  assert(A);
+  cs *AT = cs_transpose (A, 1);
+  assert(AT);
+  cs *ATA = cs_multiply (AT, A);
+  assert(ATA);
+  cs_gaxpy(AT, b, x_temp);
+
+  end = std::chrono::steady_clock::now();
+  std::cout << "Compute Time = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
+
+  // Convert Csparse to Amgcl
+  begin = std::chrono::steady_clock::now();
+  Csparse2AMGCL(ATA, ptr, col, val);
+  assert(rhs.size() == m);
+  assert(ptr.size() == mm+1);
+  assert(col.size() == max_nz);
+  assert(val.size() == max_nz);
+
+  for(int i=0; i<mm; ++i){
+    rhs[i] = x_temp[i];
+  }
+  end = std::chrono::steady_clock::now();
+  std::cout << "Convert Time = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
+
+  begin = std::chrono::steady_clock::now();
+  // Delete stuff
+  cs_spfree(A);
+  cs_spfree(AT);
+  cs_spfree(ATA);
+  cs_spfree(a);
+  delete [] b;
+  delete [] x_temp;
+  delete [] lhs;
+  end = std::chrono::steady_clock::now();
+  std::cout << "Free = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
+
+  // Solve by amgcl library
+  std::vector<double> x(n, 0.0);
+  Solver::params prm;
+  prm.solver.tol = tolerance;
+  prm.solver.maxiter = 10;
+
+  begin = std::chrono::steady_clock::now();
+  Solver solve(std::tie(n, ptr, col, val), prm);
+  end = std::chrono::steady_clock::now();
+  std::cout << "Prepare = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
+
+  int iters = 0;
+  double error = 0.0;
+  begin = std::chrono::steady_clock::now();
+  std::tie(iters, error) = solve(rhs, x);
+  for (int i = 0; i < n; i++) io[i] = x[i];
+  end = std::chrono::steady_clock::now();
+  std::cout << "Solver time = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
+  std::cout<<iters<<","<<error<<"\n";
+  std::cout<<"------------------------------------\n";
+  return 1;
+}
+
+
+#else
+
+static int 
+MinimizeAMGCL(const RNSystemOfEquations *system, RNScalar *io, RNScalar tolerance)
+{
+  // Print error message
+  fprintf(stderr, "Cannot minimize equation: Amgcl solver disabled during compile.\n");
+  fprintf(stderr, "Enable it by adding -DRN_USE_AMGCL and -lamgcl xxx to compilation and link commands.\n");
+  return 0;
+}
+
+#endif
 
 ////////////////////////////////////////////////////////////////////////
 // CERES Stuff
@@ -720,9 +964,18 @@ MinimizeMINPACK(const RNSystemOfEquations *system, RNScalar *io, RNScalar tolera
 
 #include "CSparse/CSparse.h"
 
+//std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+//std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
+
+//std::cout << "Time difference = " << std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count() << "[µs]" << std::endl;
+//std::cout << "Time difference = " << std::chrono::duration_cast<std::chrono::nanoseconds> (end - begin).count() << "[ns]" << std::endl;
 static int 
 MinimizeCSPARSE(const RNSystemOfEquations *system, RNScalar *io, RNScalar tolerance)
 {
+
+  std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+  std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
+
   // Get convenient variables
   const int n = system->NVariables();
   const int mm = system->NEquations();
@@ -734,7 +987,6 @@ MinimizeCSPARSE(const RNSystemOfEquations *system, RNScalar *io, RNScalar tolera
     fprintf(stderr, "Unable to allocate cs matrix: %d %d\n", n, max_nz);
     return 0;
   }
-    
   // Allocate B vector
   double *b = new double [ mm ];
   for (int i = 0; i < mm; i++) b[i] = 0;
@@ -746,7 +998,10 @@ MinimizeCSPARSE(const RNSystemOfEquations *system, RNScalar *io, RNScalar tolera
   // Allocate temporary data for rows
   double *lhs = new double [ n ];
   for (int i = 0; i < n; i++) lhs[i] = 0;
+  end = std::chrono::steady_clock::now();
+  std::cout << "Initial time = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
 
+  begin = std::chrono::steady_clock::now();
   // Fill matrix
   int m = 0;
   for (int i = 0; i < system->NEquations(); i++) {
@@ -754,7 +1009,6 @@ MinimizeCSPARSE(const RNSystemOfEquations *system, RNScalar *io, RNScalar tolera
 
     // Initialize constant term
     double rhs = -equation->Evaluate(x);
-
     // Mark variables in equation
     int nz = 0;
     int variable_count = 0;
@@ -778,13 +1032,16 @@ MinimizeCSPARSE(const RNSystemOfEquations *system, RNScalar *io, RNScalar tolera
       m++;
     }
   }
+  end = std::chrono::steady_clock::now();
+  std::cout << "Fill Matrix time = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
 
+  begin = std::chrono::steady_clock::now();
   // Just checking
   assert(a->m == m);
   assert(a->n == n);
   assert(a->n == system->NVariables());
   assert(a->m <= system->NEquations());
-  assert(a->nz <= system->NPartialDerivatives());
+  assert(a->nz <= max_nz);// system->NPartialDerivatives());
 
   // Setup aT * a * x = aT * b        
   cs *A = cs_compress(a);
@@ -794,10 +1051,17 @@ MinimizeCSPARSE(const RNSystemOfEquations *system, RNScalar *io, RNScalar tolera
   cs *ATA = cs_multiply (AT, A);
   assert(ATA);
   cs_gaxpy(AT, b, x);
+  //std::cout<<x[0];
+  end = std::chrono::steady_clock::now();
+  std::cout << "Compute time = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
 
+  //cs_print(ATA, 0);
   // Solve linear system
   // int status = cs_lusol (1, ATA, x, RN_EPSILON);
+  begin = std::chrono::steady_clock::now();
   int status = cs_cholsol (1, ATA, x);
+  end = std::chrono::steady_clock::now();
+  std::cout << "Solver time = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
   if (status == 0) fprintf(stderr, "Error in CSPARSE solver\n");
   else { for (int i = 0; i < n; i++) io[i] = x[i]; }
 
@@ -809,6 +1073,8 @@ MinimizeCSPARSE(const RNSystemOfEquations *system, RNScalar *io, RNScalar tolera
   delete [] b;
   delete [] x;
   delete [] lhs;
+
+  std::cout<<"------------------------------------\n";
 
   // Return status
   return status;
@@ -838,6 +1104,7 @@ Minimize(RNScalar *x, int solver, RNScalar tolerance) const
   else if (solver == RN_MINPACK_SOLVER) return MinimizeMINPACK(this, x, tolerance);
   else if (solver == RN_CERES_SOLVER) return MinimizeCERES(this, x, tolerance);
   else if (solver == RN_CSPARSE_SOLVER) return MinimizeCSPARSE(this, x, tolerance);
+  else if (solver == RN_AMGCL_SOLVER) return MinimizeAMGCL(this, x, tolerance);
   fprintf(stderr, "System of equation solver not recognized: %d\n", solver);
   return 0;
 }

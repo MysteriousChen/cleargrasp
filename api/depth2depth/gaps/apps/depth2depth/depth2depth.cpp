@@ -9,7 +9,9 @@
 #include "R2Shapes/R2Shapes.h"
 #include "RNMath/RNMath.h"
 #include "hdf5.h"
-
+#include <omp.h>
+#include <thread>
+#include <vector>
 
 
 ////////////////////////////////////////////////////////////////////////
@@ -47,7 +49,8 @@ static double range_weight = 0;
 static int normalize_tangent_vectors = 0;
 static int xres = 0;
 static int yres = 0;
-static int solver = RN_CSPARSE_SOLVER;
+//static int solver = RN_CSPARSE_SOLVER;
+static int solver = RN_AMGCL_SOLVER;
 static R3Matrix camera_intrinsics(0, 0, 0, 0, 0, 0, 0, 0, 1); 
 static double gravity_vector_in_camera_coordinates[3] = { 0, 0, -1 };
 static double plot_max_value = 1;
@@ -606,11 +609,12 @@ WriteOutputs(void)
 static int
 CreateSmoothnessEquations(RNSystemOfEquations& equations)
 {
+  const bool x_smooth_flag = input_smoothness_weight_images[0] != NULL;
+  const bool y_smooth_flag = input_smoothness_weight_images[1] != NULL;
   // Check smoothness weight
-  if ((smoothness_weight == 0) && !input_smoothness_weight_images[0] && !input_smoothness_weight_images[1]) return 1;
+  if ((smoothness_weight == 0) && !x_smooth_flag && !y_smooth_flag) return 1;
   
   // Create smoothness equations
-  int count = 0;
   for (int iy = 0; iy < yres; iy++) {
     for (int ix = 0; ix < xres; ix++) {
       // Check if pixel is in a hole
@@ -619,55 +623,50 @@ CreateSmoothnessEquations(RNSystemOfEquations& equations)
       // Add smoothness equations
       if (ix > 0) {
         RNScalar w = smoothness_weight;
-        if (input_smoothness_weight_images[0]) w *= input_smoothness_weight_images[0]->GridValue(ix-1, iy);
+        if (x_smooth_flag) w *= input_smoothness_weight_images[0]->GridValue(ix-1, iy);
         if (w > 0) {
           RNPolynomial *e = new RNPolynomial();
           e->AddTerm(-1.0, (iy)*xres+(ix),   1.0);
           e->AddTerm( 1.0, (iy)*xres+(ix-1), 1.0);
           e->Multiply(w);
           equations.InsertEquation(e);
-          count++;
         }
       }
       if (ix < xres-1) {
         RNScalar w = smoothness_weight;
-        if (input_smoothness_weight_images[0]) w *= input_smoothness_weight_images[0]->GridValue(ix, iy);
+        if (x_smooth_flag) w *= input_smoothness_weight_images[0]->GridValue(ix, iy);
         if (w > 0) {
           RNPolynomial *e = new RNPolynomial();
           e->AddTerm(-1.0, (iy)*xres+(ix),   1.0);
           e->AddTerm( 1.0, (iy)*xres+(ix+1), 1.0);
           e->Multiply(w);
           equations.InsertEquation(e);
-          count++;
         }
       }
       if (iy > 0) {
         RNScalar w = smoothness_weight;
-        if (input_smoothness_weight_images[1]) w *= input_smoothness_weight_images[1]->GridValue(ix, iy-1);
+        if (y_smooth_flag) w *= input_smoothness_weight_images[1]->GridValue(ix, iy-1);
         if (w > 0) {
           RNPolynomial *e = new RNPolynomial();
           e->AddTerm(-1.0, (iy)  *xres+(ix),   1.0);
           e->AddTerm( 1.0, (iy-1)*xres+(ix), 1.0);
           e->Multiply(w);
           equations.InsertEquation(e);
-          count++;
         }
       }
       if (iy < yres-1) {
         RNScalar w = smoothness_weight;
-        if (input_smoothness_weight_images[1]) w *= input_smoothness_weight_images[1]->GridValue(ix, iy);
+        if (y_smooth_flag) w *= input_smoothness_weight_images[1]->GridValue(ix, iy);
         if (w > 0) {
           RNPolynomial *e = new RNPolynomial();
           e->AddTerm(-1.0, (iy)  *xres+(ix),   1.0);
           e->AddTerm( 1.0, (iy+1)*xres+(ix), 1.0);
           e->Multiply(w);
           equations.InsertEquation(e);
-          count++;
         }
       }
     }
   }
-
   // Return success
   return 1;
 }
@@ -737,7 +736,6 @@ CreateInertiaEquations(RNSystemOfEquations& equations)
     e->Multiply(1000);
     equations.InsertEquation(e);
   }
-
   // Return success
   return 1;
 }
@@ -1052,11 +1050,10 @@ CreateNormalEquations(RNSystemOfEquations& equations)
   return 1;
 }
 
-
-
 static int
 CreateTangentEquations(RNSystemOfEquations& equations)
 {
+
   // Create tangent-normal equations
   if (input_normals_images[0] && input_normals_images[1] && input_normals_images[2] && (tangent_weight > 0)) {
     // Check camera intrinsics
@@ -1064,9 +1061,13 @@ CreateTangentEquations(RNSystemOfEquations& equations)
       fprintf(stderr, "You must provide camera intrinsics to create normal equations\n");
       return 0;
     }
-
+    const float fx = (float)camera_intrinsics[0][0];
+    const float fy = (float)camera_intrinsics[1][1];
+    const float cx = (float)camera_intrinsics[0][2];
+    const float cy = (float)camera_intrinsics[1][2];
     // Create tangent equations
-    for (int iy = 0; iy < yres; iy++) {
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int iy = 0; iy < yres; iy=iy+1) {
       for (int ix = 0; ix < xres; ix++) {
         RNScalar input_nx = input_normals_images[0]->GridValue(ix, iy);
         if (input_nx == R2_GRID_UNKNOWN_VALUE) continue;
@@ -1075,10 +1076,9 @@ CreateTangentEquations(RNSystemOfEquations& equations)
         RNScalar input_nz = input_normals_images[2]->GridValue(ix, iy);
         if (input_nz == R2_GRID_UNKNOWN_VALUE) continue;
         RNScalar w = tangent_weight;
-        if (!normalize_tangent_vectors) w *= camera_intrinsics[0][0];
+        if (!normalize_tangent_vectors) {w *= fx;}
         if (input_tangent_weight_image) w *= input_tangent_weight_image->GridValue(ix, iy);
         if (w == 0) continue;
-
         // Check normal direction
         if (RNIsNegativeOrZero(input_nz)) continue;
 
@@ -1092,22 +1092,21 @@ CreateTangentEquations(RNSystemOfEquations& equations)
           else { ixA = ix; iyA = iy-1; }
           if ((ixA < 0) || (ixA >= xres)) continue;
           if ((iyA < 0) || (iyA >= yres)) continue;
-
+          
           // Compute depths
           RNPolynomial d(1.0, (iy)*xres+(ix), 1.0);
           RNPolynomial dA(1.0, (iyA)*xres+(ixA), 1.0);
 
           // Compute camera coordinates
-          RNPolynomial x = d * ((ix - camera_intrinsics[0][2]) / camera_intrinsics[0][0]);
-          RNPolynomial y = d * ((iy - camera_intrinsics[1][2]) / camera_intrinsics[1][1]);
-          RNPolynomial xA = dA * ((ixA - camera_intrinsics[0][2]) / camera_intrinsics[0][0]);
-          RNPolynomial yA = dA * ((iyA - camera_intrinsics[1][2]) / camera_intrinsics[1][1]);
+          RNPolynomial x = d * ((ix - cx) / fx);
+          RNPolynomial y = d * ((iy - cy) / fy);
+          RNPolynomial xA = dA * ((ixA - cx) / fx);
+          RNPolynomial yA = dA * ((iyA - cy) / fy);
 
           // Compute tangent vector
           RNAlgebraic *dx = new RNAlgebraic(xA - x, 0);
           RNAlgebraic *dy = new RNAlgebraic(yA - y, 0);
           RNAlgebraic *dz = new RNAlgebraic(d - dA, 0);
-
           // Normalize tangent vector
           if (normalize_tangent_vectors) {
             RNAlgebraic *ddx = new RNAlgebraic(RN_POW_OPERATION, new RNAlgebraic(*dx), 2);
@@ -1129,13 +1128,15 @@ CreateTangentEquations(RNSystemOfEquations& equations)
           dot = new RNAlgebraic(RN_ADD_OPERATION, dot, dotz);
 
           // Add equation for error
-          RNAlgebraic *e = new RNAlgebraic(RN_MULTIPLY_OPERATION, dot, w);
-          equations.InsertEquation(e);
+          #pragma omp critical
+          {
+            RNAlgebraic *e = new RNAlgebraic(RN_MULTIPLY_OPERATION, dot, w);
+            equations.InsertEquation(e);
+          }
         }
       }
     }
   }
-
   // Return success
   return 1;
 }
@@ -1183,10 +1184,26 @@ CreateRangeEquations(RNSystemOfEquations& equations)
 /////////////////////////////////////////////////////////////////
 // Core solver function
 ////////////////////////////////////////////////////////////////////////
+#include <chrono>
+
+//std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+//std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
+
+//std::cout << "Time difference = " << std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count() << "[µs]" << std::endl;
+//std::cout << "Time difference = " << std::chrono::duration_cast<std::chrono::nanoseconds> (end - begin).count() << "[ns]" << std::endl;
+
+#include <fstream>
 
 static int
 CreateDepthImage(void)
 {
+  //std::ofstream myfile;
+  //myfile.open ("cost_times.txt");
+  std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+  std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
+  std::chrono::steady_clock::time_point x_begin = std::chrono::steady_clock::now();
+  std::chrono::steady_clock::time_point x_end = std::chrono::steady_clock::now();
+
   // Start statistics
   RNTime start_time;
   start_time.Read();
@@ -1205,49 +1222,85 @@ CreateDepthImage(void)
   for (int i = 0; i < n; i++) equations.SetUpperBound(i, maximum_depth);
 
   // Add basic equations
+  begin = std::chrono::steady_clock::now();
   int equations_count =0;
   CreateInertiaEquations(equations);
   int inertia_equations_count = equations.NEquations() - equations_count;
   equations_count = equations.NEquations();
+  //int inertia_equations_count = 0;
+  end = std::chrono::steady_clock::now();
+  std::cout << "CreateInertiaEquations = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
+
+  begin = std::chrono::steady_clock::now();
   CreateSmoothnessEquations(equations);
   int smoothness_equations_count = equations.NEquations() - equations_count;
   equations_count = equations.NEquations();
-
+  //int smoothness_equations_count = 0;
+  //equations.PrintEquations();
   // Solve for initial guess 
-  equations.Minimize(x, RN_CSPARSE_SOLVER, 1E-3);
+  end = std::chrono::steady_clock::now();
+  std::cout << "CreateSmoothnessEquations = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
 
+  /* Aborting for new amgcl library
+  printf("Initial SSD = %g\n", equations.SumOfSquaredResiduals(x));
+  begin = std::chrono::steady_clock::now();
+  equations.Minimize(x, solver, 1E-15);
+  end = std::chrono::steady_clock::now();
+  std::cout << "Total Solver Time 1 = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
+  printf("Final SSD = %g\n", equations.SumOfSquaredResiduals(x));
+  std::cout << "----------------------------------------\n";
   // Print initial guess
   if (print_debug) {
     R2Grid tmp(xres, yres);
     for (int i = 0; i < n; i++) tmp.SetGridValue(i, x[i]);
     tmp.WriteFile("sd.pfm");
   }
+  */
 
+  begin = std::chrono::steady_clock::now();
   // Add more equations
   CreateDUVEquations(equations);
   int derivative_equations_count = equations.NEquations() - equations_count;
   equations_count = equations.NEquations();
+  end = std::chrono::steady_clock::now();
+  std::cout << "CreateDUVEquations = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
+
+  begin = std::chrono::steady_clock::now();
   CreateNormalEquations(equations);
   int normal_equations_count = equations.NEquations() - equations_count;
   equations_count = equations.NEquations();
+  end = std::chrono::steady_clock::now();
+  std::cout << "CreateNormalEquations = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
+
+  begin = std::chrono::steady_clock::now();
   CreateTangentEquations(equations);
   int tangent_equations_count = equations.NEquations() - equations_count;
   equations_count = equations.NEquations();
+  end = std::chrono::steady_clock::now();
+  std::cout << "CreateTangentEquations = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
+
+  begin = std::chrono::steady_clock::now();
   CreateRangeEquations(equations);
   int range_equations_count = equations.NEquations() - equations_count;
   equations_count = equations.NEquations();
-
+  end = std::chrono::steady_clock::now();
+  std::cout << "CreateRangeEquations = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
+  std::cout << equations.NEquations() << "\n";
+  std::cout << "----------------------------------------\n";
   // Log initial ssd
+  begin = std::chrono::steady_clock::now();
   RNScalar initial_ssd = equations.SumOfSquaredResiduals(x);
   if (print_debug) printf("A %d %d %g\n", equations.NVariables(), equations.NEquations(), initial_ssd);
-
   // Solve for depth
-  if (!equations.Minimize(x, solver, 1E-3)) {
+  if (!equations.Minimize(x, solver, 1E-7)) {
     fprintf(stderr, "Unable to minimize system of equations\n");
     delete [] x;
     return 0;
   }
+  end = std::chrono::steady_clock::now();
+  std::cout << "Total solver time  = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
   
+  begin = std::chrono::steady_clock::now();
   // Log final ssd
   RNScalar final_ssd = equations.SumOfSquaredResiduals(x);
   if (print_debug) printf("B %d %d %g\n", equations.NVariables(), equations.NEquations(), final_ssd);
@@ -1264,6 +1317,9 @@ CreateDepthImage(void)
   for (int i = 0; i < n; i++) {
     output_depth_image->SetGridValue(i, x[i]);
   }
+
+  end = std::chrono::steady_clock::now();
+  std::cout << "Write output depth = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
 
   // Print message
   if (print_verbose) {
@@ -1282,9 +1338,14 @@ CreateDepthImage(void)
     fflush(stdout);
   }
 
+  std::cout << "-----------------------------------\n";
+  //myfile.close();
+
   // Delete variables
   delete [] x;
 
+  x_end = std::chrono::steady_clock::now();
+  std::cout << "Create Depth (inner) = " << std::chrono::duration_cast<std::chrono::milliseconds>(x_end - x_begin).count() << "[ms]" << std::endl;
   // Return success
   return 1;
 }
@@ -1307,6 +1368,7 @@ ParseArgs(int argc, char **argv)
       else if (!strcmp(*argv, "-ceres")) solver = RN_CERES_SOLVER;
       else if (!strcmp(*argv, "-splm")) solver = RN_SPLM_SOLVER;
       else if (!strcmp(*argv, "-csparse")) solver = RN_CSPARSE_SOLVER;
+      else if (!strcmp(*argv, "-amgcl")) solver = RN_AMGCL_SOLVER;
       else if (!strcmp(*argv, "-input_normals")) { argc--; argv++; input_normals_filename = *argv; }
       else if (!strcmp(*argv, "-input_derivatives")) { argc--; argv++; input_duv_filename = *argv; }
       else if (!strcmp(*argv, "-input_duv")) { argc--; argv++; input_duv_filename = *argv; }
@@ -1378,14 +1440,24 @@ ParseArgs(int argc, char **argv)
 int 
 main(int argc, char **argv)
 {
+
+  std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+  std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
   // Parse program arguments
   if (!ParseArgs(argc, argv)) exit(-1);
-
+  
+  begin = std::chrono::steady_clock::now();
   // Read inputs
   if (!ReadInputs()) exit(-1);
+  end = std::chrono::steady_clock::now();
+  std::cout << "ReadInput = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
+  std::cout << "----------------------------------------\n";
 
+  begin = std::chrono::steady_clock::now();
   // Create images
   if (!CreateDepthImage()) exit(-1);
+  end = std::chrono::steady_clock::now();
+  std::cout << "Create Depth = " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
 
   // Write outputs
   if (!WriteOutputs()) exit(-1);

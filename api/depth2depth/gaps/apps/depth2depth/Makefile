@@ -25,8 +25,8 @@ NAME=depth2depth
 #USER_LIBS = -L/usr/lib/x86_64-linux-gnu/ -lhdf5_serial
 #USER_CFLAGS=-DRN_USE_CSPARSE /usr/lib/x86_64-linux-gnu/
 
-USER_LIBS=-L/usr/include/hdf5/serial/ -lhdf5_serial
-USER_CFLAGS=-DRN_USE_CSPARSE "/usr/include/hdf5/serial/"
+USER_LIBS=-L/usr/include/hdf5/serial/ -lhdf5_serial -fopenmp
+USER_CFLAGS=-DRN_USE_CSPARSE "/usr/include/hdf5/serial/" -fopenmp
 
 
 #
@@ -41,8 +41,7 @@ CCSRCS=$(NAME).cpp
 # Libraries
 #
 
-PKG_LIBS=-lR2Shapes -lRNMath -lRNBasics -ljpeg -lpng -lCSparse
-
+PKG_LIBS=-lR2Shapes -lRNMath -lRNBasics -ljpeg -lpng -lCSparse 
 
 
 #
